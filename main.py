@@ -4,11 +4,9 @@ import requests
 from bs4 import BeautifulSoup
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import UserIsBlocked, PeerIdInvalid
+from pyrogram.errors import UserIsBlocked, PeerIdInvalid, Timeout
 from pymongo import MongoClient
 from urllib.parse import quote_plus
-from flask import Flask
-import threading
 
 # ------------------- #
 # CONFIGURATION       #
@@ -17,7 +15,7 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MONGO_URI = os.getenv("MONGO_URI", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram user ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your 
 
 # Constants
 INITIAL_CREDITS = 5
@@ -36,8 +34,7 @@ app = Client(
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client.vehicle_bot
 users_collection = db.users
-users_collection.create_index("user_id", unique=True)
-user_states = {}  # To manage conversation states
+user_states = {} # To manage conversation states
 
 # ------------------- #
 # DATABASE HELPERS    #
@@ -73,8 +70,15 @@ def get_vehicle_details(rc_number: str) -> dict:
     headers = {
         "Host": "vahanx.in",
         "Connection": "keep-alive",
+        "sec-ch-ua": "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"",
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": "\"Android\"",
+        "Upgrade-Insecure-Requests": "1",
         "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
-        "Referer": "https://vahanx.in/rc-search"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Referer": "https://vahanx.in/rc-search",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "en-US,en;q=0.9"
     }
 
     try:
@@ -87,18 +91,11 @@ def get_vehicle_details(rc_number: str) -> dict:
         return {"error": str(e)}
 
     def get_value(label):
-    try:
-        # Match even if label text has extra spaces, colons, or case differences
-        span = soup.find("span", string=lambda s: s and label.lower() in s.lower())
-        if not span:
-            return "N/A"
-        div = span.find_parent("div")
-        if not div:
-            return "N/A"
-        value = div.find("p")
-        return value.get_text(strip=True) if value else "N/A"
-    except Exception:
-        return "N/A"
+        try:
+            div = soup.find("span", string=label).find_parent("div")
+            return div.find("p").get_text(strip=True)
+        except AttributeError:
+            return None
 
     data = {
         "Owner Name": get_value("Owner Name"),
@@ -130,6 +127,7 @@ def get_vehicle_details(rc_number: str) -> dict:
 # ------------------- #
 # MAIN MENU & FILTERS #
 # ------------------- #
+
 async def send_main_menu(message_or_query):
     user = message_or_query.from_user
     welcome_text = f"👋 Welcome back, {user.first_name}!\nYour account is ready to use."
@@ -207,10 +205,13 @@ async def broadcast_command(client: Client, message: Message):
 async def vehicle_info_handler(client: Client, message: Message):
     user_id = message.from_user.id
 
+    # Only process vehicle numbers if the user is in the correct state
     if user_states.get(user_id) != "awaiting_vehicle_number":
         return
 
+    # Clear the state to prevent re-processing
     user_states.pop(user_id, None)
+
     user = get_user(user_id)
     if not user:
         add_user_to_db(user_id, message.from_user.first_name)
@@ -230,13 +231,9 @@ async def vehicle_info_handler(client: Client, message: Message):
     user = get_user(user_id)
     new_credits = "Unlimited" if user.get("is_premium") else user.get("credits", 0)
 
-    response = f"**✅ Details for `{rc_number.upper()}`**\n\n"
-for k, v in details.items():
-    response += f"**{k}:** `{v if v else 'N/A'}`\n"
-
-user = get_user(user_id)
-new_credits = "Unlimited" if user.get("is_premium") else user.get("credits", 0)
-response += f"\n---\n**Credits: {new_credits}**"
+    response = f"**✅ Details for `{rc_number.upper()}`**\n\n" + "\n".join([f"**{k}:** `{v}`" for k, v in details.items() if v and v != "N/A"])
+    response += f"\n\n---\n**Credits: {new_credits}**"
+    await msg.edit_text(response)
 
 # ------------------- #
 # ADMIN COMMANDS      #
@@ -260,6 +257,9 @@ async def user_action_command(client: Client, message: Message, action: str):
     users_collection.update_one({"user_id": target_id}, {"$set": action_map[action]})
     await message.reply_text(f"✅ User `{target_id}` has been updated.")
 
+
+
+
 # ------------------- #
 # CALLBACK HANDLERS   #
 # ------------------- #
@@ -282,14 +282,12 @@ async def callback_handler(client: Client, query: CallbackQuery):
     elif data == "referral":
         link = f"https://t.me/{(await client.get_me()).username}?start={user_id}"
         await query.message.edit_text(f"**👥 Referral System 👥**\n\nInvite friends, earn **{REFERRAL_BONUS} credits**!\n\nYour link: `{link}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Share", url=f"https://t.me/share/url?url={quote_plus(link)}&text=...")], [back_button]]))
-    elif data == "credits": 
-        await query.message.edit_text(f"💰 **My Credits** 💰\n\nYou have **{'Unlimited' if user.get('is_premium') else user.get('credits', 0)}** credits.", reply_markup=InlineKeyboardMarkup([[back_button]]))
-    elif data == "stats": 
-        await query.message.edit_text(f"📊 **Your Stats** 📊\n\n**Referred:** `{user.get('referrals', 0)}`\n**Lookups:** `{user.get('lookups_done', 0)}`", reply_markup=InlineKeyboardMarkup([[back_button]]))
-    elif data == "help": 
-        await query.message.edit_text("ℹ️ **Help** ℹ️\n\n- Use the buttons to navigate.\n- Send a vehicle number to get details.", reply_markup=InlineKeyboardMarkup([[back_button]]))
-    elif data == "back_to_main": 
-        await send_main_menu(query)
+    elif data == "credits": await query.message.edit_text(f"💰 **My Credits** 💰\n\nYou have **{'Unlimited' if user.get('is_premium') else user.get('credits', 0)}** credits.", reply_markup=InlineKeyboardMarkup([[back_button]]))
+    elif data == "stats": await query.message.edit_text(f"📊 **Your Stats** 📊\n\n**Referred:** `{user.get('referrals', 0)}`\n**Lookups:** `{user.get('lookups_done', 0)}`", reply_markup=InlineKeyboardMarkup([[back_button]]))
+    elif data == "help": await query.message.edit_text("ℹ️ **Help** ℹ️\n\n- Use the buttons to navigate.\n- Send a vehicle number to get details.", reply_markup=InlineKeyboardMarkup([[back_button]]))
+    elif data == "back_to_main": await send_main_menu(query)
+    
+    # Admin Callbacks
     elif data == "admin_panel" and user_id == ADMIN_ID:
         keyboard = [
             [InlineKeyboardButton("📈 Full Statistics", callback_data="admin_stats")],
@@ -304,35 +302,21 @@ async def callback_handler(client: Client, query: CallbackQuery):
             "`/broadcast` (reply to a message)",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+    
     elif data == "admin_stats" and user_id == ADMIN_ID:
         stats = {
-            "Total Users": users_collection.count_documents({}), 
-            "Banned": users_collection.count_documents({"is_banned": True}),
-            "Premium": users_collection.count_documents({"is_premium": True}), 
-            "Total Lookups": sum(u.get('lookups_done', 0) for u in users_collection.find({}))
+            "Total Users": users_collection.count_documents({}), "Banned": users_collection.count_documents({"is_banned": True}),
+            "Premium": users_collection.count_documents({"is_premium": True}), "Total Lookups": sum(u.get('lookups_done', 0) for u in users_collection.find({}))
         }
         await query.message.edit_text("📈 **Full Bot Stats** 📈\n\n" + "\n".join([f"**{k}:** `{v}`" for k, v in stats.items()]), reply_markup=InlineKeyboardMarkup([[admin_back_button]]))
 
+
     await query.answer()
-
-# ------------------- #
-# Flask dummy server  #
-# ------------------- #
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def home():
-    return "✅ Vehicle Info Bot is running on Render!"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port)
 
 # ------------------- #
 # BOT EXECUTION       #
 # ------------------- #
 if __name__ == "__main__":
-    print("🚀 Bot is starting with Interactive Admin Panel...")
-    threading.Thread(target=run_flask).start()   # Start Flask in background
+    print("Bot is starting with Interactive Admin Panel...")
     app.run()
     print("Bot has stopped.")
